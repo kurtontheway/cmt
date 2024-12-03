@@ -1,42 +1,351 @@
-"""A tool used to create curve controls.
+"""The control module provides functions and a graphical interface to create,
+manipulate, import and export curve controls.
 
-Curves can be serialized into json format and added to the curve library for future creation.
+.. image:: control.png
 
-Usage:
+The APIs provided allow curve shapes to be abstracted from transforms.  This allows the
+creation of rigging constructs independent of actual curve shapes which can vary
+greatly from asset to asset.  The general workflow would be to create rig controls
+with transforms only without shapes.  After the rigs are created, add shapes to the
+transforms with this tool/API.  The shapes can then be serialized to disk to load back
+in an automated build.
 
-From the menu:
-CMT > Rigging > Create Control
+Example Usage
+=============
 
-To show the UI:
-import cmt.rig.control
-cmt.rig.control.ui()
+The Control Creator tool can be accessed in the cmt menu::
 
-API:
-data = dump(['curve1'])
-new_curve = create_curve(data)
+    CMT > Rigging > Control Creator
+
+API
+---
+::
+
+    import cmt.rig.control as control
+    curve = cmds.circle()[0]
+
+    # Save the curve to disk
+    file_path = "{}/control.json".format(cmds.workspace(q=True, rd=True))
+    control.export_curves([curve], file_path)
+
+    # Load the curve back in
+    cmds.file(n=True, f=True)
+    control.import_curves(file_path)
+
+    # Create another copy of the curve
+    control.import_new_curves(file_path)
+
+    # Create the curve on the selected transform
+    node = cmds.createNode('transform', name='newNode')
+    control.import_curves_on_selected(file_path)
+
+    # Manipulate the curve before creating
+    curve = control.load_curves(file_path)[0]
+    curve.scale_by(2, 2, 2)
+    curve.set_rotation(0, 60, 0)
+    curve.set_translation(10, 5, 0)
+    new_node = curve.create("anotherNode")
+
+    # Mirror the curve
+    mirrored = cmds.createNode("transform", name="mirroredNode")
+    cmds.setAttr("{}.t".format(mirrored), -10, -5, 2)
+    cmds.setAttr("{}.r".format(mirrored), -55, 10, 63)
+    control.mirror_curve(new_node, mirrored)
+
 """
-from functools import partial
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import json
 import os
 import logging
-from cmt.qt import QtWidgets
-from cmt.qt import QtGui
-from cmt.qt import QtCore
+import webbrowser
+
 import maya.cmds as cmds
-from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
+import maya.api.OpenMaya as OpenMaya
+
+from cmt.settings import DOCUMENTATION_ROOT
 import cmt.shortcuts as shortcuts
 
 logger = logging.getLogger(__name__)
-CONTROLS_DIRECTORY = os.path.join(os.path.dirname(__file__), 'controls')
-
-# The message attribute specifying which nodes are part of a transform stack.
-STACK_ATTRIBUTE = 'cmt_transformStack'
+CONTROLS_DIRECTORY = os.path.join(os.path.dirname(__file__), "controls")
+HELP_URL = "{}/rig/control.html".format(DOCUMENTATION_ROOT)
 
 
-def ui():
-    """Display the control creator ui."""
-    win = ControlWindow()
-    win.show()
+def export_curves(controls=None, file_path=None):
+    """Serializes the given curves into the control library.
+
+    :param controls: Optional list of controls to export. If no controls are specified,
+        the selected curves will be exported.
+    :param file_path: File path to export to
+    :return: The exported list of ControlShapes.
+    """
+    if file_path is None:
+        file_path = shortcuts.get_save_file_name("*.json", "cmt.control")
+        if not file_path:
+            return
+    if controls is None:
+        controls = cmds.ls(sl=True)
+    data = get_curve_data(controls)
+    with open(file_path, "w") as fh:
+        json.dump(data, fh, indent=4, cls=CurveShapeEncoder)
+        logger.info("Exported controls to {}".format(file_path))
+    return data
+
+
+def get_curve_data(controls=None):
+    """Get the serializable data of the given controls.
+
+    :param controls: Controls to serialize
+    :return: List of ControlShape objects
+    """
+    if controls is None:
+        controls = cmds.ls(sl=True)
+    data = [CurveShape(transform=control) for control in controls]
+    # Prune empty curves
+    data = [x for x in data if x.cvs]
+    return data
+
+
+def import_new_curves(file_path=None, tag_as_controller=False):
+    """Imports control shapes from disk onto new transforms.
+
+    :param file_path: Path to the control file.
+    :param tag_as_controller: True to tag the curve transform as a controller
+    :return: The new curve transforms
+    """
+    controls = load_curves(file_path)
+    transforms = []
+    for curve in controls:
+        transform = _get_new_transform_name(curve.transform)
+        transforms.append(curve.create(transform, tag_as_controller))
+    return transforms
+
+
+def import_curves(file_path=None, tag_as_controller=False):
+    """Imports control shapes from disk onto their saved named transforms.
+
+    :param file_path: Path to the control file.
+    :param tag_as_controller: True to tag the curve transform as a controller
+    :return: The new curve transforms
+    """
+    controls = load_curves(file_path)
+
+    transforms = [
+        curve.create(curve.transform, tag_as_controller) for curve in controls
+    ]
+    return transforms
+
+
+def import_curves_on_selected(file_path=None, tag_as_controller=False):
+    """Imports a control shape from disk onto the selected transform.
+
+    :param file_path: Path to the control file.
+    :param tag_as_controller: True to tag the curve transform as a controller
+    :return: The new curve transform
+    """
+    controls = load_curves(file_path)
+    selected_transforms = cmds.ls(sl=True)
+    if not selected_transforms:
+        return
+
+    for transform in selected_transforms:
+        for curve in controls:
+            curve.create(transform, tag_as_controller)
+    return selected_transforms
+
+
+def load_curves(file_path=None):
+    """Load the CurveShape objects from disk.
+
+    :param file_path:
+    :return:
+    """
+    if file_path is None:
+        file_path = shortcuts.get_open_file_name("*.json", "cmt.control")
+        if not file_path:
+            return
+
+    with open(file_path, "r") as fh:
+        data = json.load(fh)
+    logger.info("Loaded controls {}".format(file_path))
+    curves = [CurveShape(**control) for control in data]
+    return curves
+
+
+def _get_new_transform_name(base):
+    """Get a new unique transform name
+
+    :param base: Base name
+    :return: A unique name of a non-existing transform
+    """
+    name = base
+    i = 1
+    while cmds.objExists(name):
+        name = "{}{}".format(base, i)
+        i += 1
+    return name
+
+
+class CurveShape(object):
+    """Represents the data required to build a nurbs curve shape"""
+
+    def __init__(
+        self, transform=None, cvs=None, degree=3, form=0, knots=None, color=None
+    ):
+        self.cvs = cvs
+        self.degree = degree
+        self.form = form
+        self.knots = knots
+        self.color = color
+        self.transform_matrix = OpenMaya.MTransformationMatrix()
+        self.transform = transform
+        if transform and cmds.objExists(transform) and not cvs:
+            self._set_from_curve(transform)
+
+    def _set_from_curve(self, transform):
+        """Store the parameters from an existing curve in the CurveShape object.
+
+        :param transform: Transform
+        """
+        shape = shortcuts.get_shape(transform)
+        if shape and cmds.nodeType(shape) == "nurbsCurve":
+            create_attr = "{}.create".format(shape)
+            connection = cmds.listConnections(create_attr, plugs=True, d=False)
+            if connection:
+                cmds.disconnectAttr(connection[0], create_attr)
+            self.transform = transform
+            self.cvs = cmds.getAttr("{}.cv[*]".format(shape))
+            self.degree = cmds.getAttr("{}.degree".format(shape))
+            self.form = cmds.getAttr("{}.form".format(shape))
+            self.knots = get_knots(shape)
+            if cmds.getAttr("{}.overrideEnabled".format(shape)):
+                if cmds.getAttr("{}.overrideRGBColors".format(shape)):
+                    self.color = cmds.getAttr("{}.overrideColorRGB".format(shape))[0]
+                else:
+                    self.color = cmds.getAttr("{}.overrideColor".format(shape))
+            else:
+                self.color = None
+            if connection:
+                cmds.connectAttr(connection[0], create_attr)
+
+    def create(self, transform=None, as_controller=True):
+        """Create a curve.
+
+        :param transform: Name of the transform to create the curve shape under.
+            If the transform does not exist, it will be created.
+        :param as_controller: True to mark the curve transform as a controller.
+        :return: The transform of the new curve shapes.
+        """
+        transform = transform or self.transform
+        if not cmds.objExists(transform):
+            transform = cmds.createNode("transform", name=transform)
+        periodic = self.form == 2
+        points = self._get_transformed_points()
+        points = points + points[: self.degree] if periodic else points
+        curve = cmds.curve(degree=self.degree, p=points, per=periodic, k=self.knots)
+        shape = shortcuts.get_shape(curve)
+        if self.color is not None:
+            cmds.setAttr("{}.overrideEnabled".format(shape), True)
+            if isinstance(self.color, int):
+                cmds.setAttr("{}.overrideColor".format(shape), self.color)
+            else:
+                cmds.setAttr("{}.overrideRGBColors".format(shape), True)
+                cmds.setAttr("{}.overrideColorRGB".format(shape), *self.color)
+        cmds.parent(shape, transform, r=True, s=True)
+        shape = cmds.rename(shape, "{}Shape".format(transform))
+        cmds.delete(curve)
+        if as_controller:
+            cmds.controller(transform)
+        logger.info("Created curve {} for transform {}".format(shape, transform))
+        return transform
+
+    def _get_transformed_points(self):
+        matrix = self.transform_matrix.asMatrix()
+        points = [OpenMaya.MPoint(*x) * matrix for x in self.cvs]
+        points = [(p.x, p.y, p.z) for p in points]
+        return points
+
+    def translate_by(self, x, y, z, local=True):
+        """Translate the curve cvs by the given values
+
+        :param x: Translate X
+        :param y: Translate Y
+        :param z: Translate Z
+        :param local: True for local space, False for world
+        """
+        space = OpenMaya.MSpace.kObject if local else OpenMaya.MSpace.kWorld
+        self.transform_matrix.translateBy(OpenMaya.MVector(x, y, z), space)
+
+    def set_translation(self, x, y, z, local=True):
+        """Set the absolute translation of the curve shape.
+
+        :param x: Translate X
+        :param y: Translate Y
+        :param z: Translate Z
+        :param local: True for local space, False for world
+        """
+        space = OpenMaya.MSpace.kObject if local else OpenMaya.MSpace.kWorld
+        self.transform_matrix.setTranslation(OpenMaya.MVector(x, y, z), space)
+
+    def rotate_by(self, x, y, z, local=True):
+        """Rotate the curve cvs by the given euler rotation values
+
+        :param x: Rotate X
+        :param y: Rotate Y
+        :param z: Rotate Z
+        :param local: True for local space, False for world
+        """
+        x, y, z = [v * 0.0174533 for v in [x, y, z]]
+        space = OpenMaya.MSpace.kObject if local else OpenMaya.MSpace.kWorld
+        self.transform_matrix.rotateBy(OpenMaya.MEulerRotation(x, y, z), space)
+
+    def set_rotation(self, x, y, z):
+        """Set the absolute rotation of the curve shape in euler rotations.
+
+        :param x: Rotate X
+        :param y: Rotate Y
+        :param z: Rotate Z
+        """
+        x, y, z = [v * 0.0174533 for v in [x, y, z]]
+        self.transform_matrix.setRotation(OpenMaya.MEulerRotation(x, y, z))
+
+    def scale_by(self, x, y, z, local=True):
+        """Scale the curve cvs by the given amount.
+
+        :param x: Scale X
+        :param y: Scale Y
+        :param z: Scale Z
+        :param local: True for local space, False for world
+        """
+        space = OpenMaya.MSpace.kObject if local else OpenMaya.MSpace.kWorld
+        self.transform_matrix.scaleBy([x, y, z], space)
+
+    def set_scale(self, x, y, z, local=True):
+        """Set the absolute scale of the curve shape.
+
+        :param x: Scale X
+        :param y: Scale Y
+        :param z: Scale Z
+        :param local: True for local space, False for world
+        """
+        space = OpenMaya.MSpace.kObject if local else OpenMaya.MSpace.kWorld
+        self.transform_matrix.setScale([x, y, z], space)
+
+
+class CurveShapeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, CurveShape):
+            return {
+                "cvs": obj.cvs,
+                "degree": obj.degree,
+                "form": obj.form,
+                "knots": obj.knots,
+                "color": obj.color,
+                "transform": obj.transform,
+            }
+        return json.JSONEncoder.default(self, obj)
 
 
 def rotate_components(rx, ry, rz, nodes=None):
@@ -51,78 +360,37 @@ def rotate_components(rx, ry, rz, nodes=None):
         nodes = cmds.ls(sl=True) or []
     for node in nodes:
         pivot = cmds.xform(node, q=True, rp=True, ws=True)
-        cmds.rotate(rx, ry, rz, '{0}.cv[*]'.format(node), r=True, p=pivot, os=True, fo=True)
+        cmds.rotate(
+            rx, ry, rz, "{0}.cv[*]".format(node), r=True, p=pivot, os=True, fo=True
+        )
 
 
-def create_curves(curves):
-    for curve in curves:
-        create_curve(curve)
+def mirror_curve(source, destination):
+    """Mirrors the curve on source across the YZ plane to destination.
 
-    # Now parent the curves
-    for curve in curves:
-        if curve.get('parent'):
-            parent = curve['parent']
-            if cmds.objExists(parent):
-                cmds.parent(curve['name'], parent)
+    The cvs will be mirrored in world space no matter the transform of destination.
 
-    # Then create the stacks
-    for curve in curves:
-        if curve.get('stack'):
-            create_transform_stack(curve['name'], curve['stack'])
-
-def create_curve(control):
-    """Create a curve.
-
-    :param control: A data dictionary generated from the dump function.
-    :return: The created curve.
+    :param source: Source transform
+    :param destination: Destination transform
+    :return: The mirrored CurveShape object
     """
-    periodic = control['form'] == 2
-    degree = control['degree']
-    points = control['cvs']
-    points = points + points[:degree] if periodic else points
-    curve = cmds.curve(degree=degree, p=points, n=control['name'], per=periodic, k=control['knots'])
-    cmds.xform(curve, ws=True, matrix=control['xform'])
-    cmds.xform(curve, piv=control['pivot'])
-    cmds.delete(curve, constructionHistory=True)
-    cmds.setAttr('{0}.overrideEnabled'.format(curve), control['overrideEnabled'])
-    cmds.setAttr('{0}.overrideRGBColors'.format(curve), control['overrideRGBColors'])
-    cmds.setAttr('{0}.overrideColorRGB'.format(curve), *control['overrideColorRGB'])
-    cmds.setAttr('{0}.overrideColor'.format(curve), control['overrideColor'])
-    return curve
+    source_curve = CurveShape(source)
 
+    path_source = shortcuts.get_dag_path2(source)
+    matrix = path_source.inclusiveMatrix()
 
-def dump(curves=None, stack=False):
-    """Get a data dictionary representing all the given curves.
+    path_destination = shortcuts.get_dag_path2(destination)
+    inverse_matrix = path_destination.inclusiveMatrixInverse()
 
-    :param curves: Optional list of curves.
-    :return: A json serializable list of dictionaries containing the data required to recreate the curves.
-    """
-    if curves is None:
-        curves = cmds.ls(sl=True) or []
-    data = []
-    for node in curves:
-        shape = shortcuts.get_shape(node)
-        if cmds.nodeType(shape) == 'nurbsCurve':
-            control = {
-                'name': node,
-                'cvs': cmds.getAttr('{0}.cv[*]'.format(node)),
-                'degree': cmds.getAttr('{0}.degree'.format(node)),
-                'form': cmds.getAttr('{0}.form'.format(node)),
-                'xform': cmds.xform(node, q=True, ws=True, matrix=True),
-                'knots': get_knots(node),
-                'pivot': cmds.xform(node, q=True, rp=True),
-                'overrideEnabled': cmds.getAttr('{0}.overrideEnabled'.format(node)),
-                'overrideRGBColors': cmds.getAttr('{0}.overrideRGBColors'.format(node)),
-                'overrideColorRGB': cmds.getAttr('{0}.overrideColorRGB'.format(node))[0],
-                'overrideColor': cmds.getAttr('{0}.overrideColor'.format(node)),
-            }
-            if stack:
-                control['stack'] = get_stack_count(node)
-                control['parent'] = get_stack_parent(node)
-            data.append(control)
-    if curves:
-        cmds.select(curves)
-    return data
+    world_cvs = [OpenMaya.MPoint(*x) * matrix for x in source_curve.cvs]
+    for cv in world_cvs:
+        cv.x *= -1
+    local_cvs = [p * inverse_matrix for p in world_cvs]
+    source_curve.cvs = [(p.x, p.y, p.z) for p in local_cvs]
+    is_controller = cmds.controller(source, q=True, isController=True)
+    source_curve.transform = destination
+    source_curve.create(destination, as_controller=is_controller)
+    return source_curve
 
 
 def get_knots(curve):
@@ -132,281 +400,27 @@ def get_knots(curve):
     :return: A list of knot values that can be passed into the curve creation command.
     """
     curve = shortcuts.get_shape(curve)
-    info = cmds.createNode('curveInfo')
-    cmds.connectAttr('{0}.worldSpace'.format(curve), '{0}.inputCurve'.format(info))
-    knots = cmds.getAttr('{0}.knots[*]'.format(info))
+    info = cmds.createNode("curveInfo")
+    cmds.connectAttr("{0}.worldSpace".format(curve), "{0}.inputCurve".format(info))
+    knots = cmds.getAttr("{0}.knots[*]".format(info))
+    knots = [int(x) for x in knots]
     cmds.delete(info)
     return knots
 
 
-def dump_controls(curves=None):
-    """Serializes the given curves into the control library.
+def documentation():
+    webbrowser.open(HELP_URL)
 
-    :param curves: Optional list of curves.
+
+def get_control_paths_in_library():
+    """Get the file paths of all controls in the library.
+
+    :return: List of file paths
     """
-    if curves is None:
-        curves = cmds.ls(sl=True)
-    data = dump(curves)
-    for curve in data:
-        name = curve['name']
-        file_path = os.path.join(CONTROLS_DIRECTORY, '{0}.json'.format(name))
-        logger.info('Exporting %s', file_path)
-        fh = open(file_path, 'w')
-        json.dump(curve, fh, indent=4)
-        fh.close()
-
-
-class ControlWindow(MayaQWidgetDockableMixin, QtWidgets.QDialog):
-    """The UI used to create and manipulate curves from the curve library."""
-
-    def __init__(self, parent=None):
-        super(ControlWindow, self).__init__(parent)
-        self.setWindowTitle('CMT Control Creator')
-        self.resize(300, 500)
-        vbox = QtWidgets.QVBoxLayout(self)
-
-        size = 20
-        label_width = 60
-        icon_left = QtGui.QIcon(QtGui.QPixmap(':/nudgeLeft.png').scaled(size, size))
-        icon_right = QtGui.QIcon(QtGui.QPixmap(':/nudgeRight.png').scaled(size, size))
-        validator = QtGui.QDoubleValidator(-180.0, 180.0, 2)
-        grid = QtWidgets.QGridLayout()
-        vbox.addLayout(grid)
-
-        # Rotate X
-        label = QtWidgets.QLabel('Rotate X')
-        label.setMaximumWidth(label_width)
-        grid.addWidget(label, 0, 0, QtCore.Qt.AlignRight)
-        b = QtWidgets.QPushButton(icon_left, '')
-        b.released.connect(partial(self.rotate_x, direction=-1))
-        grid.addWidget(b, 0, 1)
-        self.offset_x = QtWidgets.QLineEdit('45.0')
-        self.offset_x.setValidator(validator)
-        grid.addWidget(self.offset_x, 0, 2)
-        b = QtWidgets.QPushButton(icon_right, '')
-        b.released.connect(partial(self.rotate_x, direction=1))
-        grid.addWidget(b, 0, 3)
-
-        # Rotate Y
-        label = QtWidgets.QLabel('Rotate Y')
-        label.setMaximumWidth(label_width)
-        grid.addWidget(label, 1, 0, QtCore.Qt.AlignRight)
-        b = QtWidgets.QPushButton(icon_left, '')
-        b.released.connect(partial(self.rotate_y, direction=-1))
-        grid.addWidget(b, 1, 1)
-        self.offset_y = QtWidgets.QLineEdit('45.0')
-        self.offset_y.setValidator(validator)
-        grid.addWidget(self.offset_y, 1, 2)
-        b = QtWidgets.QPushButton(icon_right, '')
-        b.released.connect(partial(self.rotate_y, direction=1))
-        grid.addWidget(b, 1, 3)
-
-        # Rotate Z
-        label = QtWidgets.QLabel('Rotate Z')
-        label.setMaximumWidth(label_width)
-        grid.addWidget(label, 2, 0, QtCore.Qt.AlignRight)
-        b = QtWidgets.QPushButton(icon_left, '')
-        b.released.connect(partial(self.rotate_z, direction=-1))
-        grid.addWidget(b, 2, 1)
-        self.offset_z = QtWidgets.QLineEdit('45.0')
-        self.offset_z.setValidator(validator)
-        grid.addWidget(self.offset_z, 2, 2)
-        b = QtWidgets.QPushButton(icon_right, '')
-        b.released.connect(partial(self.rotate_z, direction=1))
-        grid.addWidget(b, 2, 3)
-        grid.setColumnStretch(2, 2)
-
-        hbox = QtWidgets.QHBoxLayout()
-        vbox.addLayout(hbox)
-        b = QtWidgets.QPushButton('Export Selected')
-        b.released.connect(self.dump_controls)
-        hbox.addWidget(b)
-
-        b = QtWidgets.QPushButton('Set Color')
-        b.released.connect(self.set_color)
-        hbox.addWidget(b)
-
-        hbox = QtWidgets.QHBoxLayout()
-        vbox.addLayout(hbox)
-        b = QtWidgets.QPushButton('Create Selected')
-        b.released.connect(self.create_selected)
-        hbox.addWidget(b)
-
-        b = QtWidgets.QPushButton('Remove Selected')
-        b.released.connect(self.remove_selected)
-        hbox.addWidget(b)
-
-        hbox = QtWidgets.QHBoxLayout()
-        vbox.addLayout(hbox)
-        self.stack_count = QtWidgets.QSpinBox()
-        self.stack_count.setValue(2)
-        hbox.addWidget(self.stack_count)
-
-        b = QtWidgets.QPushButton('Create Transform Stack')
-        b.released.connect(self.create_transform_stack)
-        b.setToolTip('Creates a transform stack above each selected node.')
-        hbox.addWidget(b)
-
-        self.control_list = QtWidgets.QListWidget()
-        self.control_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        vbox.addWidget(self.control_list)
-
-        self.populate_controls()
-
-    def populate_controls(self):
-        """Populates the control list with the available controls stored in CONTROLS_DIRECTORY."""
-        self.control_list.clear()
-        controls = [os.path.splitext(x)[0] for x in os.listdir(CONTROLS_DIRECTORY) if x.endswith('.json')]
-        controls.sort()
-        self.control_list.addItems(controls)
-
-    def rotate_x(self, direction):
-        """Callback function to rotate the components around the x axis by the amount of degrees in offset_x.
-
-        :param direction: 1 or -1
-        """
-        amount = float(self.offset_x.text()) * direction
-        rotate_components(amount, 0, 0)
-
-    def rotate_y(self, direction):
-        """Callback function to rotate the components around the y axis by the amount of degrees in offset_y.
-
-        :param direction: 1 or -1
-        """
-        amount = float(self.offset_y.text()) * direction
-        rotate_components(0, amount, 0)
-
-    def rotate_z(self, direction):
-        """Callback function to rotate the components around the z axis by the amount of degrees in offset_z.
-
-        :param direction: 1 or -1
-        """
-        amount = float(self.offset_z.text()) * direction
-        rotate_components(0, 0, amount)
-
-    def dump_controls(self):
-        """Dumps the selected curves to into the CONTROLS_DIRECTORY so they can be added to the library."""
-        dump_controls()
-        self.populate_controls()
-
-    def set_color(self):
-        """Open a dialog to set the override RGB color of the selected nodes."""
-        nodes = cmds.ls(sl=True) or []
-        if nodes:
-            color = cmds.getAttr('{0}.overrideColorRGB'.format(nodes[0]))[0]
-            color = QtGui.QColor(color[0]*255, color[1]*255, color[2]*255)
-            color = QtWidgets.QColorDialog.getColor(color, self, 'Set Curve Color')
-            if color.isValid():
-                color = [color.redF(), color.greenF(), color.blueF()]
-                for node in nodes:
-                    cmds.setAttr('{0}.overrideEnabled'.format(node), True)
-                    cmds.setAttr('{0}.overrideRGBColors'.format(node), True)
-                    cmds.setAttr('{0}.overrideColorRGB'.format(node), *color)
-
-    def create_selected(self):
-        """Create the curves selected in the curve list."""
-        curves = []
-        sel = cmds.ls(sl=True)
-        target = sel[0] if sel else None
-        for item in self.control_list.selectedItems():
-            text = item.text()
-            control_file = os.path.join(CONTROLS_DIRECTORY, '{0}.json'.format(text))
-            fh = open(control_file, 'r')
-            data = json.load(fh)
-            fh.close()
-            curve = create_curve(data)
-            if target:
-                cmds.delete(cmds.parentConstraint(target, curve))
-            curves.append(curve)
-        if curves:
-            cmds.select(curves)
-
-    def remove_selected(self):
-        """Remove the curves selected in the curve list from the curve library."""
-        items = self.control_list.selectedItems()
-        if items:
-            button = QtWidgets.QMessageBox.question(self, 'Remove Controls',
-                                                'Are you sure you want to remove the selected controls?',
-                                                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-            if button == QtWidgets.QMessageBox.Yes:
-                for item in items:
-                    text = item.text()
-                    control_file = os.path.join(CONTROLS_DIRECTORY, '{0}.json'.format(text))
-                    os.remove(control_file)
-                self.populate_controls()
-
-    def create_transform_stack(self):
-        count = self.stack_count.value()
-        for node in (cmds.ls(sl=True) or []):
-            create_transform_stack(node, count)
-
-
-def create_transform_stack(node, count=2):
-    """Creates a transform stack above the given node.
-
-    Any previous transform stack will be deleted.
-
-    :param node: Node to parent into a transform stack.
-    :param count: Number of transforms to add in the stack.
-    :return: A list of the transform nodes created starting from top to bottom.
-    """
-    previous_parent = cmds.listRelatives(node, parent=True, path=True)
-    if previous_parent:
-        previous_parent = previous_parent[0]
-        while previous_parent and STACK_ATTRIBUTE in (cmds.listAttr(previous_parent, ud=True) or []):
-            parent = cmds.listRelatives(previous_parent, parent=True, path=True)
-            if parent:
-                cmds.parent(node, parent)
-                parent = parent[0]
-            else:
-                cmds.parent(node, world=True)
-            cmds.delete(previous_parent)
-            previous_parent = parent
-
-    nulls = []
-    for i in reversed(range(count)):
-        name = '_'.join(node.split('_')[:-1])
-        name = '{0}_{1}nul'.format(name, i+1)
-        null = cmds.createNode('transform', name=name)
-        nulls.append(null)
-        cmds.addAttr(null, ln=STACK_ATTRIBUTE, at='message')
-        cmds.connectAttr('{0}.message'.format(node), '{0}.{1}'.format(null, STACK_ATTRIBUTE))
-        cmds.delete(cmds.parentConstraint(node, null))
-        if previous_parent:
-            cmds.parent(null, previous_parent)
-        previous_parent = null
-    cmds.parent(node, previous_parent)
-    return nulls
-
-
-def get_stack_count(node):
-    """Get the number of transforms in the stack.
-
-    :param node: Node to query.
-    :return: The number of transforms in the stack.
-    """
-    connections = cmds.listConnections('{0}.message'.format(node), plugs=True) or []
-    count = 0
-    for connection in connections:
-        connected_node, attribute = connection.split('.')
-        if attribute == STACK_ATTRIBUTE:
-            count += 1
-    return count
-
-
-def get_stack_parent(node):
-    """Get the parent of the transform stack belonging to the given node.
-
-    :param node: Node to query.
-    :return: The parent node or None if there is no parent.
-    """
-    previous_parent = cmds.listRelatives(node, parent=True, path=True)
-    if not previous_parent:
-        return None
-    previous_parent = previous_parent[0]
-    while previous_parent and STACK_ATTRIBUTE in (cmds.listAttr(previous_parent, ud=True) or []):
-        parent = cmds.listRelatives(previous_parent, parent=True, path=True)
-        if parent:
-            parent = parent[0]
-        previous_parent = parent
-    return previous_parent
+    controls = [
+        os.path.splitext(x)[0]
+        for x in os.listdir(CONTROLS_DIRECTORY)
+        if x.endswith(".json")
+    ]
+    controls.sort()
+    return controls

@@ -6,7 +6,7 @@ CMT is licensed under:
 
 The MIT License (MIT)
 
-Copyright (c) 2016 Chad Vernon
+Copyright (c) 2018 Chad Vernon
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +27,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 import logging
+
 log = logging.getLogger(__name__)
 
 
@@ -35,5 +36,6 @@ def initialize():
     Runs any initialization for CMT such as creating the menu.
     """
     import cmt.menu
-    cmt.menu.create_menu()
+    import cmt.reloadmodules
 
+    cmt.menu.create_menu()
